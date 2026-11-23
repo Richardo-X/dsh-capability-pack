@@ -1,0 +1,11 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+.vw_write_test/
+vw_*/
+frames/
+*.m4s
+*.mp4
+*.mkv
+*.wav
+*.mp3

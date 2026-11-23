@@ -1,0 +1,21 @@
+﻿# 技能/插件的构建与运行产物
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+dist/
+lib/*.map
+
+# 媒体与输出（体积大，不入库）
+*.m4s
+*.mp4
+*.mkv
+*.wav
+*.mp3
+frames/
+vw_*/
+.vw_write_test/
+
+# 系统
+.DS_Store
+Thumbs.db
