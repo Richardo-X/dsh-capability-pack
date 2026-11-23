@@ -225,9 +225,18 @@ def cmd_probe(a):
 
 # ---------------------------------------------------------------- 转写
 
-MODEL_CANDIDATES = [
-    os.path.join(os.environ.get("LOCALAPPDATA", ""), "video-watch", "fw-small"),
-]
+def _default_model_dir():
+    """各平台默认放模型的位置。"""
+    la = os.environ.get("LOCALAPPDATA")
+    if la:                                  # Windows
+        return os.path.join(la, "video-watch", "fw-small")
+    if sys.platform == "darwin":            # macOS
+        return os.path.expanduser("~/Library/Caches/video-watch/fw-small")
+    xdg = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(xdg, "video-watch", "fw-small")
+
+
+MODEL_CANDIDATES = [_default_model_dir()]
 
 
 def resolve_model(name_or_path):
@@ -284,20 +293,56 @@ def cmd_transcribe(a):
         for i, s in enumerate(segs, 1):
             f.write(f"{i}\n{srt_time(s['start'])} --> {srt_time(s['end'])}\n{s['text']}\n\n")
 
-    # 可疑段：低置信度或模型自认"这里没人说话"
-    risky = [s for s in segs if s["avg_logprob"] < -0.8 or s["no_speech_prob"] > 0.6]
-    with open(os.path.join(out, "risky.md"), "w", encoding="utf-8") as f:
-        f.write("# 需要人工核对的段落\n\n")
-        f.write("判据：avg_logprob < -0.8（模型自己不确定）或 no_speech_prob > 0.6（模型认为可能没人说话）。\n")
-        f.write("这些位置最可能是**专有名词误听**，建议对照画面字幕或上下文确认。\n\n")
-        if not risky:
-            f.write("（无）\n")
-        for s in risky:
-            f.write(f"- `{ts_hms(s['start'])}` logprob={s['avg_logprob']} no_speech={s['no_speech_prob']}\n")
-            f.write(f"  - {s['text']}\n")
+    # 可疑段：用「相对」判据，不用绝对阈值。
+    # 原因：不同模型/音频的 avg_logprob 分布差异极大（实测 6 分钟中文音频
+    # 最小只有 -0.399），写死 -0.8 会让这个功能永远返回空。
+    # 而且要清醒：**高置信的错误（专有名词听成常见词）无法靠置信度发现**，
+    # 这里只能圈出「模型自己最不确定的 10%」，供人工优先核对。
+    n = len(segs)
+    if n:
+        # 取「最不确定的」固定条数，而不是百分位：
+        # VAD 合并后大量段落共享同一 logprob，按百分位取会被并列撑到 30%+，
+        # 那样清单就没法看了。清单的价值在于「短到能逐条核对」。
+        k = max(5, min(15, int(n * 0.10)))
+        ranked = sorted(range(n), key=lambda i: segs[i]["avg_logprob"])
+        pick = set(ranked[:k])
+        pick |= {i for i, s in enumerate(segs) if s["no_speech_prob"] > 0.5}
+        flagged = [segs[i] for i in sorted(pick)]
+        cut = segs[ranked[k - 1]]["avg_logprob"] if k <= n else 0.0
+    else:
+        cut = 0.0
+        flagged = []
 
-    print(json.dumps({"dir": out, "segments": len(segs), "elapsed": round(dt),
-                      "risky": len(risky),
+    # 重复句：相邻两段文本完全相同，是典型的转写抖动
+    repeats = []
+    for a_, b_ in zip(segs, segs[1:]):
+        if a_["text"].strip() and a_["text"].strip() == b_["text"].strip():
+            repeats.append(b_)
+
+    with open(os.path.join(out, "risky.md"), "w", encoding="utf-8") as f:
+        f.write("# 建议优先人工核对的段落\n\n")
+        f.write(f"本片共 {n} 段。下面两类被圈出：\n\n")
+        f.write(f"1. **模型最不确定的 {len(flagged)} 段**（按 `avg_logprob` 从低到高取，"
+                f"最差 `{cut:.3f}`）\n")
+        f.write("2. **模型认为可能没人说话**（`no_speech_prob > 0.5`）\n\n")
+        f.write("> ⚠️ **重要限制**：判据 1、2 都是从「模型自报的置信度」来的。\n")
+        f.write("> 但专有名词被听成常见词时（例如 Hermes→爱马仕、知识库→支持库），\n")
+        f.write("> 模型往往**非常自信且完全错误**，这类错靠置信度抓不到。\n")
+        f.write("> 涉及人名、产品名、术语时，必须对照画面文字或请用户确认。\n\n")
+        if not flagged:
+            f.write("（本片没有低置信段落）\n")
+        for s in flagged:
+            f.write(f"- `{ts_hms(s['start'])}` logprob={s['avg_logprob']} "
+                    f"no_speech={s['no_speech_prob']}\n")
+            f.write(f"  - {s['text']}\n")
+        if repeats:
+            f.write(f"\n## 重复句（疑似转写抖动，{len(repeats)} 处）\n\n")
+            for s in repeats:
+                f.write(f"- `{ts_hms(s['start'])}` {s['text']}\n")
+
+    print(json.dumps({"dir": out, "segments": n, "elapsed": round(dt),
+                      "risky": len(flagged), "repeats": len(repeats),
+                      "cut": round(cut, 3),
                       "transcript": os.path.join(out, "transcript.txt")}, ensure_ascii=False))
 
 
@@ -459,12 +504,25 @@ def cmd_zoom(a):
     """裁切一块区域并放大，专门用来读画面里的小字。"""
     from PIL import Image
     im = Image.open(a.image)
+    W, H = im.size
     if a.region:
         try:
             x, y, w, h = [int(v) for v in a.region.replace("，", ",").split(",")]
         except ValueError:
             die('--region 格式应为 "x,y,w,h"（原始像素）')
-        x2, y2 = min(x + w, im.width), min(y + h, im.height)
+        if w <= 0 or h <= 0:
+            die(f"--region 的宽高必须大于 0（收到 w={w}, h={h}）")
+
+        # 越界处理：完全在外则报错，部分越界则裁到边界并提示
+        if x >= W or y >= H:
+            die(f"--region 起点 ({x},{y}) 超出图片范围，这张图是 {W}x{H}。\n"
+                f"        合法范围：x < {W}，y < {H}")
+        x2 = min(x + w, W)
+        y2 = min(y + h, H)
+        clamped = (x2 - x != w) or (y2 - y != h)
+        if clamped:
+            log(f"注意：区域超出边界，已裁到图片范围（原 {w}x{h} → {x2-x}x{y2-y}）"
+                f"　图片尺寸 {W}x{H}")
         im = im.crop((max(0, x), max(0, y), x2, y2))
     if a.scale and a.scale != 1:
         im = im.resize((im.width * a.scale, im.height * a.scale), Image.LANCZOS)
@@ -481,12 +539,12 @@ def cmd_doctor(a):
     import importlib
     import shutil
 
-    rows = []
+    rows = []   # (名称, 详情, 是否OK, 怎么解决, 是否必需)
 
     # Python
     pv = sys.version.split()[0]
     ok = sys.version_info >= (3, 9)
-    rows.append(("Python", f"{pv}  ({sys.platform})", ok, "需要 3.9+"))
+    rows.append(("Python", f"{pv}  ({sys.platform})", ok, "需要 3.9+", True))
 
     # 必需库
     need = [
@@ -497,17 +555,18 @@ def cmd_doctor(a):
         try:
             m = importlib.import_module(mod)
             v = getattr(m, "__version__", "")
-            rows.append((mod, f"{v}  {why.split(' —— ')[0]}", True, how))
+            rows.append((mod, f"{v}  {why.split(' —— ')[0]}", True, how, True))
         except Exception:
-            rows.append((mod, "未安装", False, how))
+            rows.append((mod, "未安装", False, how, True))
 
     # 可选但强烈建议
     try:
         import faster_whisper as fw
-        rows.append(("faster-whisper", f"{getattr(fw, '__version__', '?')}  转写", True, ""))
+        rows.append(("faster-whisper", f"{getattr(fw, '__version__', '?')}  转写",
+                     True, "", True))
     except Exception:
-        rows.append(("faster-whisper", "未安装（只会抽帧，不能转写）",
-                     False, "pip install faster-whisper 'av<19'"))
+        rows.append(("faster-whisper", "未安装（只能抽帧，不能转写）",
+                     False, "pip install faster-whisper 'av<19'", True))
 
     # 模型
     model = None
@@ -517,43 +576,49 @@ def cmd_doctor(a):
             break
     if model:
         sz = os.path.getsize(os.path.join(model, "model.bin")) / 1048576
-        rows.append(("模型", f"{model}  ({sz:.0f} MB)", True, ""))
+        rows.append(("模型", f"{model}  ({sz:.0f} MB)", True, "", True))
     else:
         rows.append(("模型", "未找到（首次运行会下载约 460 MB）", False,
-                     f"放到 {MODEL_CANDIDATES[0]}，或联网自动下载"))
+                     f"放到 {MODEL_CANDIDATES[0]}，或联网自动下载", True))
 
-    # 网络（B 站 API）
+    # 网络（B 站 API）—— 软失败：断网时本地文件依然可用
     try:
         d = http_json("https://api.bilibili.com/x/web-interface/view?bvid=BV1o4xg6RE9m",
                       BILI_UA, timeout=8)
         ok = d.get("code") == 0
-        rows.append(("B站 API", "可达" if ok else f"异常 code={d.get('code')}", ok, "直连不行时先下好文件再本地处理"))
+        rows.append(("B站 API", "可达" if ok else f"异常 code={d.get('code')}", ok,
+                     "直连不行时先下好文件再本地处理", False))
     except Exception as e:
-        rows.append(("B站 API", f"不可达（{type(e).__name__}）", False, "本地文件仍可用"))
+        rows.append(("B站 API", f"不可达（{type(e).__name__}）", False,
+                     "只影响 BV 号直接抓取；本地文件仍可用", False))
 
     # 输出目录可写
     try:
         probe_dir = os.path.join(os.getcwd(), ".vw_write_test")
         os.makedirs(probe_dir, exist_ok=True)
         os.rmdir(probe_dir)
-        rows.append(("输出目录", f"{os.getcwd()} 可写", True, ""))
+        rows.append(("输出目录", f"{os.getcwd()} 可写", True, "", True))
     except Exception:
-        rows.append(("输出目录", "当前目录不可写，请用 --out 指定", False, ""))
+        rows.append(("输出目录", "当前目录不可写，请用 --out 指定", False, "", True))
 
     w = max(len(r[0]) for r in rows)
     print()
-    for name, detail, ok, how in rows:
+    for name, detail, ok, how, _req in rows:
         mark = "OK  " if ok else "缺  "
         print(f"  {mark} {name:<{w}}  {detail}")
         if not ok and how:
             print(f"       └─ 解决：{how}")
-    bad = [r for r in rows if not r[2]]
+
+    hard = [r for r in rows if r[4] and not r[2]]
+    soft = [r for r in rows if not r[4] and not r[2]]
     print()
-    if not bad:
+    if not hard:
         print("  必需项就绪：probe / transcribe / frames / zoom / fetch 全部可用")
+        if soft:
+            print(f"  （{'、'.join(r[0] for r in soft)} 不可用，仅影响对应功能）")
     else:
-        print(f"  {len(bad)} 项待处理（见上面的「解决」）")
-    return 0 if not bad else 1
+        print(f"  {len(hard)} 项必需项待处理（见上面的「解决」）")
+    return 0 if not hard else 1
 
 
 # ---------------------------------------------------------------- 一条龙

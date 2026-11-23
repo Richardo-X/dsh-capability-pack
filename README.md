@@ -31,10 +31,12 @@ git clone https://github.com/Richardo-X/dsh-capability-pack.git
 Copy-Item -Recurse "dsh-capability-pack\技能包\video-watch" "$env:USERPROFILE\.dsh\skills\video-watch"
 ```
 
-或只下单个目录：
+只想取其中一个（仓库不大，上面那种就够；这里给不想下整个仓库的）：
 
 ```powershell
-$base = "https://raw.githubusercontent.com/Richardo-X/dsh-capability-pack/main/技能包/video-watch"
+git clone --depth 1 --filter=blob:none --sparse https://github.com/Richardo-X/dsh-capability-pack.git
+cd dsh-capability-pack
+git sparse-checkout set "技能包/video-watch"
 ```
 
 技能放在下面这些位置，DSH 会自动发现（改完无需重启）：
@@ -43,6 +45,8 @@ $base = "https://raw.githubusercontent.com/Richardo-X/dsh-capability-pack/main/�
 |---|---|
 | `~/.dsh/skills/` | **所有项目** |
 | `<项目>/.dsh/skills/` | 仅该项目 |
+
+> 技能装好后，让 Agent「用 video-watch 看这个视频」即可；它也可以自己按 `SKILL.md` 的流程调用脚本。
 
 ---
 
